@@ -406,6 +406,8 @@ def loadtxt(
     usecols: Optional[Union[int, Sequence[int]]] = None,
     unpack: bool = False,
     ndmin: int = 0,
+    encoding: Optional[str] = "utf-8",
+    max_rows: Optional[int] = None,
 ) -> tf.Tensor:
     lines = tf.io.read_file(fname)
 

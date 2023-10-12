@@ -593,7 +593,7 @@ def frombuffer(
     return torch.frombuffer(buffer_copy, dtype=dtype, count=count, offset=offset)
 
 
-def torch_loadtxt(
+def loadtxt(
     fname: str,
     dtype: torch.dtype = torch.float32,
     comments: str = "#",
@@ -602,7 +602,9 @@ def torch_loadtxt(
     skiprows: int = 0,
     usecols: Optional[Union[int, Sequence[int]]] = None,
     unpack: bool = False,
-    ndmin: int = 0,
+    encoding: Optional[str] = "utf-8",
+    max_rows: Optional[int] = None,
+    ndmin: int = 0
 ):
     data = []
     with open(fname, "r") as file:

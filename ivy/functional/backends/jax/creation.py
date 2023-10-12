@@ -20,6 +20,7 @@ from ivy.functional.ivy.creation import (
     NestedSequence,
     SupportsBufferProtocol,
     _asarray_inputs_to_native_shapes,
+    _loadtxt
 )
 
 
@@ -359,18 +360,23 @@ def loadtxt(
     skiprows: int = 0,
     usecols: Optional[Union[int, Sequence[int]]] = None,
     unpack: bool = False,
+    encoding: Optional[str] = "utf-8", 
     ndmin: int = 0,
+    max_rows: Optional[int] = None
 ) -> JaxArray:
-    return jnp.loadtxt(
+    
+   return _loadtxt(
         fname,
-        dtype0=dtype,
+        dtype=dtype,
         comments=comments,
         delimiter=delimiter,
         converters=converters,
         skiprows=skiprows,
         usecols=usecols,
         unpack=unpack,
+        encoding=encoding, 
         ndmin=ndmin,
+        max_rows=max_rows
     )
 
 

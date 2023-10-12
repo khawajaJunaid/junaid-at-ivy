@@ -273,7 +273,9 @@ def loadtxt(
     skiprows: int = 0,
     usecols: Optional[Union[int, Sequence[int]]] = None,
     unpack: bool = False,
+    encoding: Optional[str] = "utf-8",
     ndmin: int = 0,
+    max_rows: Optional[int] = None
 ) -> Union[(None, mx.ndarray.NDArray)]:
     raise IvyNotImplementedException()
 

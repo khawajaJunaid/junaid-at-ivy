@@ -296,18 +296,17 @@ def triu_indices(
 
 def loadtxt(
     fname: Union[str, np.ndarray, np.generic],
-    dtype: Optional[np.dtype] = np.float64,
-    comments: str = "#",
+    dtype: Optional[Union[np.dtype, str]] = np.float64,
+    comments: Union[str, Sequence[str], None] = "#",
     delimiter: Optional[Union[str, List[str]]] = None,
-    converters: Optional[Dict[int, Union[Type, Callable]]] = None,
+    converters: Optional[Union[Dict[int, Union[Type, Callable]], Callable]] = None,
     skiprows: int = 0,
     usecols: Optional[Union[int, Sequence[int]]] = None,
     unpack: bool = False,
     ndmin: int = 0,
     encoding: Optional[str] = "bytes",
     max_rows: Optional[int] = None,
-    *,
-    device: str,
+    quotechar: Optional[Union[str, None]] = None,
 ) -> np.ndarray:
     return np.loadtxt(
         fname,
@@ -321,4 +320,5 @@ def loadtxt(
         ndmin=ndmin,
         encoding=encoding,
         max_rows=max_rows,
+        quotechar=quotechar,
     )

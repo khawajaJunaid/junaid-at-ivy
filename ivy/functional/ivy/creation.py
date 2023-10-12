@@ -15,7 +15,11 @@ from typing import (
     Dict,
 )
 import numpy as np
-
+from numpy.core._multiarray_umath import _load_from_filelike
+import os 
+import operator
+import contextlib
+from numpy.core import overrides
 # local
 import ivy
 from ivy import to_ivy
@@ -39,6 +43,344 @@ from ivy.func_wrapper import (
 # Helpers #
 # --------#
 
+
+def _ensure_ndmin_ndarray_check_param(ndmin):
+    """Just checks if the param ndmin is supported on
+        _ensure_ndmin_ndarray. It is intended to be used as
+        verification before running anything expensive.
+        e.g. loadtxt, genfromtxt
+    """
+    # Check correctness of the values of `ndmin`
+    if ndmin not in [0, 1, 2]:
+        raise ValueError(f"Illegal value of ndmin keyword: {ndmin}")
+
+def _ensure_ndmin_ndarray(a, *, ndmin: int):
+    """This is a helper function of loadtxt and genfromtxt to ensure
+        proper minimum dimension as requested
+
+        ndim : int. Supported values 1, 2, 3
+                    ^^ whenever this changes, keep in sync with
+                       _ensure_ndmin_ndarray_check_param
+    """
+    # Verify that the array has at least dimensions `ndmin`.
+    # Tweak the size and shape of the arrays - remove extraneous dimensions
+    if a.ndim > ndmin:
+        a = ivy.squeeze(a)
+    # and ensure we have the minimum number of dimensions asked for
+    # - has to be in this order for the odd case ndmin=1, a.squeeze().ndim=0
+    if a.ndim < ndmin:
+        if ndmin == 1:
+            a = ivy.atleast_1d(a)
+        elif ndmin == 2:
+            a = ivy.atleast_2d(a).T
+
+    return a
+
+def _check_nonneg_int(value, name="argument"):
+    try:
+        operator.index(value)
+    except TypeError:
+        raise TypeError(f"{name} must be an integer") from None
+    if value < 0:
+        raise ValueError(f"{name} must be nonnegative")
+
+def _preprocess_comments(iterable, comments, encoding):
+    """
+    Generator that consumes a line iterated iterable and strips out the
+    multiple (or multi-character) comments from lines.
+    This is a pre-processing step to achieve feature parity with loadtxt
+    (we assume that this feature is a nieche feature).
+    """
+    for line in iterable:
+        if isinstance(line, bytes):
+            # Need to handle conversion here, or the splitting would fail
+            line = line.decode(encoding)
+
+        for c in comments:
+            line = line.split(c, 1)[0]
+
+        yield line
+
+_loadtxt_chunksize = 50000
+def _read(fname, *, delimiter=',', comment='#', quote='"',
+          imaginary_unit='j', usecols=None, skiplines=0,
+          max_rows=None, converters=None, ndmin=None, unpack=False,
+          dtype=ivy.float64, encoding="bytes"):
+    r"""
+    Read a NumPy array from a text file.
+    This is a helper function for loadtxt.
+
+    Parameters
+    ----------
+    fname : file, str, or pathlib.Path
+        The filename or the file to be read.
+    delimiter : str, optional
+        Field delimiter of the fields in line of the file.
+        Default is a comma, ','.  If None any sequence of whitespace is
+        considered a delimiter.
+    comment : str or sequence of str or None, optional
+        Character that begins a comment.  All text from the comment
+        character to the end of the line is ignored.
+        Multiple comments or multiple-character comment strings are supported,
+        but may be slower and `quote` must be empty if used.
+        Use None to disable all use of comments.
+    quote : str or None, optional
+        Character that is used to quote string fields. Default is '"'
+        (a double quote). Use None to disable quote support.
+    imaginary_unit : str, optional
+        Character that represent the imaginary unit `sqrt(-1)`.
+        Default is 'j'.
+    usecols : array_like, optional
+        A one-dimensional array of integer column numbers.  These are the
+        columns from the file to be included in the array.  If this value
+        is not given, all the columns are used.
+    skiplines : int, optional
+        Number of lines to skip before interpreting the data in the file.
+    max_rows : int, optional
+        Maximum number of rows of data to read.  Default is to read the
+        entire file.
+    converters : dict or callable, optional
+        A function to parse all columns strings into the desired value, or
+        a dictionary mapping column number to a parser function.
+        E.g. if column 0 is a date string: ``converters = {0: datestr2num}``.
+        Converters can also be used to provide a default value for missing
+        data, e.g. ``converters = lambda s: float(s.strip() or 0)`` will
+        convert empty fields to 0.
+        Default: None
+    ndmin : int, optional
+        Minimum dimension of the array returned.
+        Allowed values are 0, 1 or 2.  Default is 0.
+    unpack : bool, optional
+        If True, the returned array is transposed, so that arguments may be
+        unpacked using ``x, y, z = read(...)``.  When used with a structured
+        data-type, arrays are returned for each field.  Default is False.
+    dtype : numpy data type
+        A NumPy dtype instance, can be a structured dtype to map to the
+        columns of the file.
+    encoding : str, optional
+        Encoding used to decode the inputfile. The special value 'bytes'
+        (the default) enables backwards-compatible behavior for `converters`,
+        ensuring that inputs to the converter functions are encoded
+        bytes objects. The special value 'bytes' has no additional effect if
+        ``converters=None``. If encoding is ``'bytes'`` or ``None``, the
+        default system encoding is used.
+
+    Returns
+    -------
+    ndarray
+        NumPy array.
+    """
+    # Handle special 'bytes' keyword for encoding
+    byte_converters = False
+    if encoding == 'bytes':
+        encoding = None
+        byte_converters = True
+
+    if dtype is None:
+        raise TypeError("a dtype must be provided.")
+    dtype = ivy.dtype(dtype)
+
+    read_dtype_via_object_chunks = None
+    if dtype.kind in 'SUM' and (
+            dtype == "S0" or dtype == "U0" or dtype == "M8" or dtype == 'm8'):
+        # This is a legacy "flexible" dtype.  We do not truly support
+        # parametric dtypes currently (no dtype discovery step in the core),
+        # but have to support these for backward compatibility.
+        read_dtype_via_object_chunks = dtype
+        dtype = ivy.dtype(object)
+
+    if usecols is not None:
+        # Allow usecols to be a single int or a sequence of ints, the C-code
+        # handles the rest
+        try:
+            usecols = list(usecols)
+        except TypeError:
+            usecols = [usecols]
+
+    _ensure_ndmin_ndarray_check_param(ndmin)
+
+    if comment is None:
+        comments = None
+    else:
+        # assume comments are a sequence of strings
+        if "" in comment:
+            raise ValueError(
+                "comments cannot be an empty string. Use comments=None to "
+                "disable comments."
+            )
+        comments = tuple(comment)
+        comment = None
+        if len(comments) == 0:
+            comments = None  # No comments at all
+        elif len(comments) == 1:
+            # If there is only one comment, and that comment has one character,
+            # the normal parsing can deal with it just fine.
+            if isinstance(comments[0], str) and len(comments[0]) == 1:
+                comment = comments[0]
+                comments = None
+        else:
+            # Input validation if there are multiple comment characters
+            if delimiter in comments:
+                raise TypeError(
+                    f"Comment characters '{comments}' cannot include the "
+                    f"delimiter '{delimiter}'"
+                )
+
+    # comment is now either a 1 or 0 character string or a tuple:
+    if comments is not None:
+        # Note: An earlier version support two character comments (and could
+        #       have been extended to multiple characters, we assume this is
+        #       rare enough to not optimize for.
+        if quote is not None:
+            raise ValueError(
+                "when multiple comments or a multi-character comment is "
+                "given, quotes are not supported.  In this case quotechar "
+                "must be set to None.")
+
+    if len(imaginary_unit) != 1:
+        raise ValueError('len(imaginary_unit) must be 1.')
+
+    _check_nonneg_int(skiplines)
+    if max_rows is not None:
+        _check_nonneg_int(max_rows)
+    else:
+        # Passing -1 to the C code means "read the entire file".
+        max_rows = -1
+
+    fh_closing_ctx = contextlib.nullcontext()
+    filelike = False
+    try:
+        if isinstance(fname, os.PathLike):
+            fname = os.fspath(fname)
+        if isinstance(fname, str):
+            fh = np.lib._datasource.open(fname, 'rt', encoding=encoding)
+            if encoding is None:
+                encoding = getattr(fh, 'encoding', 'latin1')
+
+            fh_closing_ctx = contextlib.closing(fh)
+            data = fh
+            filelike = True
+        else:
+            if encoding is None:
+                encoding = getattr(fname, 'encoding', 'latin1')
+            data = iter(fname)
+    except TypeError as e:
+        raise ValueError(
+            f"fname must be a string, filehandle, list of strings,\n"
+            f"or generator. Got {type(fname)} instead.") from e
+
+    with fh_closing_ctx:
+        if comments is not None:
+            if filelike:
+                data = iter(data)
+                filelike = False
+            data = _preprocess_comments(data, comments, encoding)
+
+        if read_dtype_via_object_chunks is None:
+            arr = _load_from_filelike(
+                data, delimiter=delimiter, comment=comment, quote=quote,
+                imaginary_unit=imaginary_unit,
+                usecols=usecols, skiplines=skiplines, max_rows=max_rows,
+                converters=converters, dtype=dtype,
+                encoding=encoding, filelike=filelike,
+                byte_converters=byte_converters)
+
+        else:
+            # This branch reads the file into chunks of object arrays and then
+            # casts them to the desired actual dtype.  This ensures correct
+            # string-length and datetime-unit discovery (like `arr.astype()`).
+            # Due to chunking, certain error reports are less clear, currently.
+            if filelike:
+                data = iter(data)  # cannot chunk when reading from file
+
+            c_byte_converters = False
+            if read_dtype_via_object_chunks == "S":
+                c_byte_converters = True  # Use latin1 rather than ascii
+
+            chunks = []
+            while max_rows != 0:
+                if max_rows < 0:
+                    chunk_size = _loadtxt_chunksize
+                else:
+                    chunk_size = min(_loadtxt_chunksize, max_rows)
+
+                next_arr = _load_from_filelike(
+                    data, delimiter=delimiter, comment=comment, quote=quote,
+                    imaginary_unit=imaginary_unit,
+                    usecols=usecols, skiplines=skiplines, max_rows=max_rows,
+                    converters=converters, dtype=dtype,
+                    encoding=encoding, filelike=filelike,
+                    byte_converters=byte_converters,
+                    c_byte_converters=c_byte_converters)
+                # Cast here already.  We hope that this is better even for
+                # large files because the storage is more compact.  It could
+                # be adapted (in principle the concatenate could cast).
+                chunks.append(next_arr.astype(read_dtype_via_object_chunks))
+
+                skiprows = 0  # Only have to skip for first chunk
+                if max_rows >= 0:
+                    max_rows -= chunk_size
+                if len(next_arr) < chunk_size:
+                    # There was less data than requested, so we are done.
+                    break
+
+            # Need at least one chunk, but if empty, the last one may have
+            # the wrong shape.
+            if len(chunks) > 1 and len(chunks[-1]) == 0:
+                del chunks[-1]
+            if len(chunks) == 1:
+                arr = chunks[0]
+            else:
+                arr = ivy.concat(chunks, axis=0)
+
+    # NOTE: ndmin works as advertised for structured dtypes, but normally
+    #       these would return a 1D result plus the structured dimension,
+    #       so ndmin=2 adds a third dimension even when no squeezing occurs.
+    #       A `squeeze=False` could be a better solution (pandas uses squeeze).
+    arr = _ensure_ndmin_ndarray(arr, ndmin=ndmin)
+
+    if arr.shape:
+        if arr.shape[0] == 0:
+            print( f'loadtxt: input contained no data: "{fname}"')
+    if unpack:
+        # Unpack structured dtypes if requested:
+        dt = arr.dtype
+        if dt.names is not None:
+            # For structured arrays, return an array for each field.
+            return [arr[field] for field in dt.names]
+        else:
+            return arr.T
+    else:
+        return arr
+
+
+def _loadtxt(fname, dtype=float, comments='#', delimiter=None,
+            converters=None, skiprows=0, usecols=None, unpack=False,
+            ndmin=0, encoding='bytes', max_rows=None, *, quotechar=None,
+            like=None):
+
+    if isinstance(delimiter, bytes):
+        delimiter.decode("latin1")
+
+    if dtype is None:
+        dtype = ivy.float64
+
+    comment = comments
+    # Control character type conversions for Py3 convenience
+    if comment is not None:
+        if isinstance(comment, (str, bytes)):
+            comment = [comment]
+        comment = [
+            x.decode('latin1') if isinstance(x, bytes) else x for x in comment]
+    if isinstance(delimiter, bytes):
+        delimiter = delimiter.decode('latin1')
+
+    arr = _read(fname, dtype=dtype, comment=comment, delimiter=delimiter,
+                converters=converters, skiplines=skiprows, usecols=usecols,
+                unpack=unpack, ndmin=ndmin, encoding=encoding,
+                max_rows=max_rows, quote=quotechar)
+
+    return arr
 
 def _asarray_handle_nestable(fn: Callable) -> Callable:
     fn_name = fn.__name__
@@ -2352,36 +2694,117 @@ def loadtxt(
     usecols: Optional[Union[int, Sequence[int]]] = None,
     unpack: bool = False,
     ndmin: int = 0,
+    encoding: Optional[str] = "bytes",
+    max_rows: Optional[int] = None,
+    quotechar = None,
+
 ) -> ivy.Array:
     r"""
     Load data from a text file.
 
     Parameters
     ----------
-    fname
-        File, filename, or generator to read.
-    dtype
-        Data-type of the resulting array; default: float.
-    comments
-        The character used to indicate the start of a comment.
-    delimiter
-        The string used to separate values.
-    converters
-        A dictionary mapping column number to a function that will
-        parse the column string,into the desired value.
-    skiprows
-        Skip the first `skiprows` lines.
-    usecols
-        Which columns to read, with 0 being the first.
-    unpack
-        If True, the returned array is transposed.
-    ndmin
+    fname : file, str, pathlib.Path, list of str, generator
+        File, filename, list, or generator to read. If the filename
+        extension is ``.gz`` or ``.bz2``, the file is first decompressed. Note
+        that generators must return bytes or strings. The strings
+        in a list or produced by a generator are treated as lines.
+    dtype : data-type, optional
+        Data-type of the resulting array; default: float. If this is a
+        structured data-type, the resulting array will be 1-dimensional, and
+        each row will be interpreted as an element of the array. In this
+        case, the number of columns used must match the number of fields in
+        the data-type.
+    comments : str or sequence of str or None, optional
+        The characters or list of characters used to indicate the start of a
+        comment. None implies no comments. For backward compatibility, byte
+        strings will be decoded as 'latin1'. The default is '#'.
+    delimiter : str, optional
+        The character used to separate the values. For backward compatibility,
+        byte strings will be decoded as 'latin1'. The default is whitespace.
+
+        Only single character delimiters are supported. Newline characters
+        cannot be used as the delimiter.
+
+    converters : dict or callable, optional
+        Converter functions to customize value parsing. If `converters` is
+        callable, the function is applied to all columns, else it must be a
+        dict that maps column number to a parser function.
+        See examples for further details.
+        Default: None.
+
+        The ability to pass a single callable to be applied to all columns
+        was added.
+
+    skiprows : int, optional
+        Skip the first `skiprows` lines, including comments; default: 0.
+    usecols : int or sequence, optional
+        Which columns to read, with 0 being the first. For example,
+        ``usecols = (1,4,5)`` will extract the 2nd, 5th and 6th columns.
+        The default, None, results in all columns being read.
+
+        When a single column has to be read it is possible to use
+        an integer instead of a tuple. E.g ``usecols = 3`` reads the
+        fourth column the same way as ``usecols = (3,)`` would.
+
+    unpack : bool, optional
+        If True, the returned array is transposed, so that arguments may be
+        unpacked using ``x, y, z = loadtxt(...)``.  When used with a
+        structured data-type, arrays are returned for each field.
+        Default is False.
+    ndmin : int, optional
         The returned array will have at least `ndmin` dimensions.
+        Otherwise mono-dimensional axes will be squeezed.
+        Legal values: 0 (default), 1 or 2.
+
+    encoding : str, optional
+        Encoding used to decode the input file. Does not apply to input streams.
+        The special value 'bytes' enables backward compatibility workarounds
+        that ensure you receive byte arrays as results if possible and pass
+        'latin1' encoded strings to converters. Override this value to receive
+        unicode arrays and pass strings as input to converters.  If set to None
+        the system default is used. The default value is 'bytes'.
+
+
+    max_rows : int, optional
+        Read `max_rows` rows of content after `skiprows` lines. The default is
+        to read all the rows. Note that empty rows containing no data such as
+        empty lines and comment lines are not counted towards `max_rows`,
+        while such lines are counted in `skiprows`.
+
+        Lines containing no data, including comment lines (e.g., lines
+        starting with '#' or as specified via `comments`) are not counted
+        towards `max_rows`.
+
+    quotechar : unicode character or None, optional
+        The character used to denote the start and end of a quoted item.
+        Occurrences of the delimiter or comment characters are ignored within
+        a quoted item. The default value is ``quotechar=None``, which means
+        quoting support is disabled.
+
+        If two consecutive instances of `quotechar` are found within a quoted
+        field, the first is treated as an escape character. See examples.
 
     Returns
     -------
-    out
+    out : ndarray
         Data read from the text file.
+
+
+    Notes
+    -----
+    This function aims to be a fast reader for simply formatted files.  The
+    `genfromtxt` function provides more sophisticated handling of, e.g.,
+    lines with missing values.
+
+    Each row in the input text file must have the same number of values to be
+    able to read all values. If all rows do not have the same number of values, a
+    subset of up to n columns (where n is the least number of values present
+    in all rows) can be read by specifying the columns via `usecols`.
+
+
+    The strings produced by the Python float.hex method can be used as
+    input for floats.
 
     Examples
     --------
@@ -2391,13 +2814,108 @@ def loadtxt(
     >>> y = ivy.loadtxt(x, dtype=ivy.float32)
     >>> print(y)
     ivy.array([[1., 2.],
-               [3., 4.]])
+            [3., 4.]])
 
     >>> x = '1,2,3\n4,5,6'
     >>> y = ivy.loadtxt(x, dtype='int', delimiter=',')
     >>> print(y)
     ivy.array([[1, 2, 3],
-               [4, 5, 6]])
+            [4, 5, 6]])
+
+    With :class:`StringIO` inputs:
+
+    >>> from io import StringIO
+    >>> c = StringIO("0 1\n2 3")
+    >>> ivy.loadtxt(c)
+    ivy.array([[0., 1.],
+            [2., 3.]])
+
+    >>> d = StringIO("M 21 72\nF 35 58")
+    >>> ivy.loadtxt(d, dtype={'names': ('gender', 'age', 'weight'),
+    ...                      'formats': ('S1', 'i4', 'f4')})
+    ivy.array([(b'M', 21, 72.), (b'F', 35, 58.)],
+            dtype=[('gender', 'S1'), ('age', '<i4'), ('weight', '<f4')])
+
+    >>> c = StringIO("1,0,2\n3,0,4")
+    >>> x, y = ivy.loadtxt(c, delimiter=',', usecols=(0, 2), unpack=True)
+    >>> x
+    ivy.array([1., 3.])
+    >>> y
+    ivy.array([2., 4.])
+
+    Using converters:
+
+    >>> s = StringIO("1.618, 2.296\n3.141, 4.669\n")
+    >>> conv = {
+    ...     0: lambda x: ivy.floor(float(x)),  # conversion fn for column 0
+    ...     1: lambda x: ivy.ceil(float(x)),   # conversion fn for column 1
+    ... }
+    >>> ivy.loadtxt(s, delimiter=",", converters=conv)
+    ivy.array([[1., 3.],
+            [3., 5.]])
+
+    Using a callable converter for all columns:
+
+    >>> s = StringIO("0xDE 0xAD\n0xC0 0xDE")
+    >>> import functools
+    >>> conv = functools.partial(int, base=16)
+    >>> ivy.loadtxt(s, converters=conv)
+    ivy.array([[222., 173.],
+            [192., 222.]])
+
+    Handling values with different formatting:
+
+    >>> s = StringIO('10.01 31.25-\n19.22 64.31\n17.57- 63.94')
+    >>> def conv(fld):
+    ...     return -float(fld[:-1]) if fld.endswith(b'-') else float(fld)
+    ...
+    >>> ivy.loadtxt(s, converters=conv)
+    ivy.array([[ 10.01, -31.25],
+            [ 19.22,  64.31],
+            [-17.57,  63.94]])
+
+    Handling values with different formatting and disabling encoding:
+
+    >>> s = StringIO('10.01 31.25-\n19.22 64.31\n17.57- 63.94')
+    >>> conv = lambda x: -float(x[:-1]) if x.endswith('-') else float(x)
+    >>> ivy.loadtxt(s, converters=conv, encoding=None)
+    ivy.array([[ 10.01, -31.25],
+            [ 19.22,  64.31],
+            [-17.57,  63.94]])
+
+    Support for quoted fields is enabled with the `quotechar` parameter.
+    Comment and delimiter characters are ignored when they appear within
+    a quoted item delineated by `quotechar`:
+
+    >>> s = StringIO('"alpha, #42", 10.0\n"beta, #64", 2.0\n')
+    >>> dtype = ivy.dtype([("label", "U12"), ("value", float)])
+    >>> ivy.loadtxt(s, dtype=dtype, delimiter=",", quotechar='"')
+    ivy.array([('alpha, #42', 10.), ('beta, #64',  2.)],
+            dtype=[('label', '<U12'), ('value', '<f8')])
+
+    Quoted fields can be separated by multiple whitespace characters:
+
+    >>> s = StringIO('"alpha, #42"       10.0\n"beta, #64" 2.0\n')
+    >>> dtype = ivy.dtype([("label", "U12"), ("value", float)])
+    >>> ivy.loadtxt(s, dtype=dtype, delimiter=None, quotechar='"')
+    ivy.array([('alpha, #42', 10.), ('beta, #64',  2.)],
+            dtype=[('label', '<U12'), ('value', '<f8')])
+
+    Two consecutive quote characters within a quoted field are treated as a
+    single escaped character:
+
+    >>> s = StringIO('"Hello, my name is ""Monty""!"')
+    >>> ivy.loadtxt(s, dtype="U", delimiter=",", quotechar='"')
+    ivy.array('Hello, my name is "Monty"!', dtype='<U26')
+
+    Read subset of columns when all rows do not contain equal number of values:
+
+    >>> d = StringIO("1 2\n2 4\n3 9 12\n4 16 20")
+    >>> ivy.loadtxt(d, usecols=(0, 1))
+    ivy.array([[ 1.,  2.],
+            [ 2.,  4.],
+            [ 3.,  9.],
+            [ 4., 16.]])
     """
     return current_backend().loadtxt(
         fname,
@@ -2409,4 +2927,7 @@ def loadtxt(
         usecols=usecols,
         unpack=unpack,
         ndmin=ndmin,
+        max_rows=max_rows,
+        encoding=encoding,
+        quotechar=quotechar
     )

@@ -11,7 +11,7 @@ import ivy_tests.test_ivy.helpers as helpers
 from ivy_tests.test_ivy.helpers import handle_test, BackendHandler
 import ivy_tests.test_ivy.helpers.globals as test_globals
 from ivy_tests.test_ivy.test_functional.test_core.test_dtype import astype_helper
-
+from io import StringIO
 
 # --- Helpers --- #
 # --------------- #
@@ -118,6 +118,8 @@ def _get_dtype_buffer_count_offset(draw):
 
     return dtype, value, count, offset
 
+# @st.composite
+# def _get_fname_
 
 @st.composite
 def _on_off_dtype(draw):
@@ -381,7 +383,13 @@ def test_from_dlpack(*, dtype_and_x, backend_fw):
 
 @handle_test(
     fn_tree="functional.ivy.frombuffer",
-    dtype_buffer_count_offset=_get_dtype_buffer_count_offset(),
+    dtype_and_x=helpers.dtype_and_values(
+        available_dtypes=helpers.get_dtypes(kind="float", full=False, key="dtype"),
+        min_num_dims=1,
+        max_num_dims=5,
+        min_dim_size=1,
+        max_dim_size=5,
+    ),
     test_instance_method=st.just(False),
     test_with_out=st.just(False),
     test_gradients=st.just(False),
@@ -400,6 +408,40 @@ def test_frombuffer(
         dtype=input_dtype[0],
         count=count,
         offset=offset,
+    )
+
+@handle_test(
+    fn_tree="functional.ivy.loadtxt",
+    test_instance_method=st.just(False),
+    test_with_out=st.just(False),
+    test_gradients=st.just(False),
+    dtypes=helpers.get_dtypes("valid", full=False),
+    dtype_and_x=helpers.dtype_and_values(
+        available_dtypes=helpers.get_dtypes(kind="float", full=False, key="dtype"),
+        min_num_dims=1,
+        max_num_dims=5,
+        min_dim_size=1,
+        max_dim_size=5,
+    ),
+)
+def test_loadtxt(
+        dtype_and_x, test_flags, backend_fw, fn_name, on_device,dtypes
+):
+    dtype, a = dtype_and_x
+    
+    # Convert array to string and then to StringIO object
+    # print("logs for debugging what is returned ",a)
+    array_string="\n".join(" ".join(map(str, row)) for row in a)
+    data = StringIO(array_string)
+    helpers.test_function(
+        input_dtypes=dtype,
+        test_flags=test_flags,
+        on_device=on_device,
+        backend_to_test=backend_fw,
+        fn_name=fn_name,
+        dtype=dtypes[0],
+        fname=data,
+        device=on_device
     )
 
 
